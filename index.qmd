@@ -5,7 +5,7 @@ format:
     theme: cosmo
 
 about:
-  template: broadside
+  template: trestles
   image: profile.jpg
   links:
     - icon: github
@@ -23,7 +23,5 @@ MS in Statistics | Sept 2026 - Present
 
 University of California, Santa Barbara | Santa Barbara, CA
 B.S in Statistics | Sept 2012 - July 2016
-
-
 
 
