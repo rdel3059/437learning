@@ -5,7 +5,7 @@ format:
     theme: cosmo
 
 about:
-  template: trestles
+  template: broadside
   image: profile.jpg
   links:
     - icon: github
@@ -15,3 +15,15 @@ about:
       text: LinkedIn
       href: https://www.linkedin.com/in/rdel3059/
 ---
+
+## Education
+
+California State University, Fullerton | Fullerton, CA
+MS in Statistics | Sept 2026 - Present
+
+University of California, Santa Barbara | Santa Barbara, CA
+B.S in Statistics | Sept 2012 - July 2016
+
+
+
+
