@@ -6,7 +6,7 @@ format:
 
 about:
   template: trestles
-  image: profile.jpg
+  image: profilepic.jpg
   links:
     - icon: github
       text: GitHub
