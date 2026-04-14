@@ -5,6 +5,8 @@ project:
 website:
   title: "math-437-portfolio"
   navbar:
+    background: "#1f3a5f"
+    foreground: "#ffffff"
     left:
       - href: index.qmd
         text: Home
@@ -15,8 +17,9 @@ website:
 
 format:
   html:
-    backgroundcolor: "#eeffee"
-    fontcolor: "darkgreen"
+    backgroundcolor: "#f7efe5"
+    fontcolor: "#1f3a5f"
+    linkcolor: "#e67e22"
     theme:
       - cosmo
       - brand
