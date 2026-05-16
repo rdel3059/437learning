@@ -1,10 +1,521 @@
+
 ---
-title: "Project 2"
+title: "Predicting Movie Profitability"
+author: "Rommel Del Fierro"
 format: html
 editor: visual
 ---
 
-# My Final Project
+# My Final Projec
 
-This page will contain my Math 437 final project.
-  
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+
+library(tidyverse)
+library(tidymodels)
+library(rpart)
+
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+theme_set(theme_minimal())
+
+here::i_am("Portfolio/Project2_Portfolio.qmd")
+
+movies_raw <- readr::read_csv(here::here("Portfolio/tmdb_5000_movies.csv"))
+```
+
+## Project Focus
+
+This project uses the TMDB 5000 Movie Dataset to study movie profitability. Each row represents one movie, with information such as budget, revenue, genre, runtime, release date, popularity, and ratings.
+
+This portfolio version builds on my original movie profitability project by keeping profitability numeric instead of turning it into a high/low category. The main question is:
+
+> How much money did a movie earn relative to what it cost to make?
+
+In this project, I measure profitability using **relative return**, based on revenue divided by budget. This compares movies by how much they earned relative to what they cost, instead of only comparing total dollar profit. A movie that makes $100 million in profit is impressive, but that story changes depending on whether it cost $5 million or $200 million to produce.
+
+```{r}
+#| label: clean-data
+
+movies <- movies_raw |>
+  dplyr::filter(
+    status == "Released",
+    budget > 0,
+    revenue > 0,
+    !is.na(runtime),
+    !is.na(release_date)
+  ) |>
+  dplyr::mutate(
+    profit = revenue - budget,
+    profit_rate = profit / budget,
+    return_multiple = revenue / budget,
+    log_return = log10(return_multiple),
+    log_budget = log10(budget),
+    release_month = as.numeric(str_sub(as.character(release_date), 6, 7)),
+    action = if_else(str_detect(genres, "Action"), 1, 0),
+    adventure = if_else(str_detect(genres, "Adventure"), 1, 0),
+    comedy = if_else(str_detect(genres, "Comedy"), 1, 0),
+    drama = if_else(str_detect(genres, "Drama"), 1, 0),
+    horror = if_else(str_detect(genres, "Horror"), 1, 0),
+    romance = if_else(str_detect(genres, "Romance"), 1, 0),
+    thriller = if_else(str_detect(genres, "Thriller"), 1, 0),
+    science_fiction = if_else(str_detect(genres, "Science Fiction"), 1, 0)
+  )
+
+dplyr::bind_rows(
+  tibble(data = "Original", n_movies = nrow(movies_raw), n_variables = ncol(movies_raw)),
+  tibble(data = "Cleaned", n_movies = nrow(movies), n_variables = ncol(movies))
+)
+```
+
+After filtering to released movies with usable budget, revenue, runtime, and release date information, the cleaned dataset contains 3,228 movies. I created `profit`, `profit_rate`, `return_multiple`, `log_return`, `log_budget`, `release_month`, and genre indicator variables.
+
+The main response variable is `log_return`, which is:
+
+$$
+\log_{10}\left(\frac{\text{revenue}}{\text{budget}}\right)
+$$
+
+A `log_return` of 0 means revenue equals budget. Positive values mean revenue was larger than budget. Negative values mean revenue was smaller than budget.
+
+I used the log version because movie returns vary by a large amount. This keeps a few extreme low-budget movies from taking over the analysis.
+
+```{r}
+#| label: split-data
+
+set.seed(1880)
+
+movies_split <- initial_split(
+  movies,
+  prop = 0.80,
+  strata = log_return
+)
+
+movies_train <- training(movies_split)
+movies_test <- testing(movies_split)
+
+dplyr::bind_rows(
+  movies_train |>
+    dplyr::summarize(
+      data_set = "Training",
+      n = n(),
+      median_log_return = median(log_return),
+      median_profit_rate = median(profit_rate)
+    ),
+  movies_test |>
+    dplyr::summarize(
+      data_set = "Testing",
+      n = n(),
+      median_log_return = median(log_return),
+      median_profit_rate = median(profit_rate)
+    )
+) |>
+  dplyr::mutate(
+    median_log_return = round(median_log_return, 3),
+    median_profit_rate = scales::percent(median_profit_rate, accuracy = 0.1)
+  )
+```
+
+I used an 80/20 training/test split. The training set is used for exploration, clustering, model fitting, and cross-validation. The test set is held out until the final model evaluation.
+
+## Exploratory Analysis
+
+Raw profit rates can be extreme when a movie has a very small reported budget. For example, a low-budget movie that earns a modest amount of money can have a very large return multiple. Because of that, I used `log_return` for the main modeling response.
+
+```{r}
+#| label: profitability-summary
+
+movies_train |>
+  dplyr::summarize(
+    median_budget = median(budget),
+    median_profit = median(profit),
+    median_return_multiple = median(return_multiple),
+    median_profit_rate = median(profit_rate),
+    median_log_return = median(log_return)
+  ) |>
+  dplyr::mutate(
+    median_budget = scales::dollar(median_budget),
+    median_profit = scales::dollar(median_profit),
+    median_return_multiple = paste0(round(median_return_multiple, 2), "x"),
+    median_profit_rate = scales::percent(median_profit_rate, accuracy = 0.1),
+    median_log_return = round(median_log_return, 3)
+  )
+
+```
+In the training set, the median movie had a budget of about $25 million and earned about 2.3 times its budget. This means the typical movie in the cleaned training data earned more than its reported production cost, but the earlier note is still important because some very small-budget movies can have unusually large return rates.
+
+
+```{r}
+#| label: log-return-histogram
+
+log_return_limits <- quantile(movies_train$log_return, probs = c(0.025, 0.975))
+
+ggplot(movies_train, aes(x = log_return)) +
+  geom_histogram(bins = 35, fill = "#2C3E50", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray45") +
+  coord_cartesian(xlim = log_return_limits) +
+  labs(
+    title = "Distribution of Movie Relative Returns",
+    subtitle = "Middle 95% of training-set movies shown; 0 means revenue equals budget",
+    x = "Log10(Revenue / Budget)",
+    y = "Number of Movies"
+  )
+```
+
+Most movies earned more than their reported budget, so most values are to the right of 0. The dashed line at 0 means revenue equals budget; values to the right mean the movie earned more than its budget, while values to the left mean it earned less. The distribution is still skewed, but the log transformation reduces the influence of extreme low-budget movies.
+
+
+
+```{r}
+#| label: budget-return-scatter
+
+budget_return_plot <- movies_train |>
+  dplyr::filter(budget >= 100000) |>
+  dplyr::mutate(
+    return_group = case_when(
+      log_return < 0 ~ "Revenue below budget",
+      log_return < log10(2) ~ "Revenue up to 2x budget",
+      TRUE ~ "Revenue more than 2x budget"
+    )
+  )
+
+ggplot(budget_return_plot, aes(x = budget, y = log_return, color = return_group)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray45") +
+  geom_point(alpha = 0.55, size = 1.6) +
+  scale_x_log10(
+    breaks = c(1e5, 1e6, 1e7, 1e8, 3e8),
+    labels = scales::label_dollar(scale = 1e-6, suffix = "M", accuracy = 0.1)
+  ) +
+  scale_y_continuous(
+    breaks = log10(c(0.01, 0.1, 0.5, 1, 2, 10, 100)),
+    labels = c("0.01x", "0.1x", "0.5x", "1x", "2x", "10x", "100x")
+  ) +
+  scale_color_manual(
+    values = c(
+      "Revenue below budget" = "#7F8C8D",
+      "Revenue up to 2x budget" = "#2C3E50",
+      "Revenue more than 2x budget" = "#D55E00"
+    )
+  ) +
+  labs(
+    title = "Budget and Relative Return",
+    subtitle = "Training-set movies with reported budgets of at least $100,000 shown",
+    x = "Budget (Millions USD, log scale)",
+    y = "Revenue as a Multiple of Budget (log scale)",
+    color = "Return Group"
+  )
+```
+
+This graph shows that high relative return is not only a big-budget pattern. Values above 1x mean the movie earned more than its budget, while values below 1x mean it earned less than its budget. Some smaller movies earned many times their budget, while some expensive movies did not earn back their reported budget. The $100,000 cutoff is only used for this graph so very tiny reported budgets do not distort the log-scale axis; the modeling data still uses the cleaned movie dataset.
+
+```{r}
+#| label: median-return-by-genre
+
+movies_train |>
+  dplyr::select(
+    profit_rate,
+    action, adventure, comedy, drama,
+    horror, romance, thriller, science_fiction
+  ) |>
+  tidyr::pivot_longer(
+    cols = -profit_rate,
+    names_to = "genre",
+    values_to = "has_genre"
+  ) |>
+  dplyr::filter(has_genre == 1) |>
+  dplyr::group_by(genre) |>
+  dplyr::summarize(
+    n = n(),
+    median_profit_rate = median(profit_rate),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(median_profit_rate) |>
+  ggplot(aes(x = reorder(genre, median_profit_rate), y = median_profit_rate)) +
+  geom_col(fill = "#2C3E50") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Median Profit Rate by Genre",
+    x = "Genre",
+    y = "Median Profit Rate"
+  )
+```
+
+I used profit_rate for this graph because percentages are easier to interpret than logged values when comparing genres. The graph shows median profit relative to budget, not total dollar profit. Horror has the highest median profit rate, which means horror movies in this dataset tended to earn more profit relative to what they cost. Because movies can belong to more than one genre, these bars describe genre membership rather than exclusive genre categories.
+
+## Unsupervised Learning: K-Means
+
+For the unsupervised learning part, I used k-means clustering. K-means is unsupervised because it does not use the response variable while forming the groups. In this project, the algorithm groups movies using budget, runtime, release month, and genre indicators. After the clusters are created, I compare their relative returns. This means log_return is checked after clustering, not used to create the clusters.
+
+I chose k-means because the results are interpretable in the context of movies. K-means creates groups of similar movies based on their budget, runtime, release month, and genre indicators. This lets me compare whether different kinds of movie profiles have different relative returns.
+
+```{r}
+#| label: kmeans-data
+
+cluster_recipe <- recipe(
+  ~ log_budget + runtime + release_month +
+    action + adventure + comedy + drama +
+    horror + romance + thriller + science_fiction,
+  data = movies_train
+) |>
+  step_normalize(all_numeric_predictors())
+
+cluster_prep <- prep(cluster_recipe)
+cluster_data <- bake(cluster_prep, new_data = NULL)
+
+set.seed(437)
+
+wss_results <- tibble(k = 1:8) |>
+  dplyr::mutate(
+    wss = purrr::map_dbl(
+      k,
+      function(k_value) {
+        kmeans(cluster_data, centers = k_value, nstart = 25)$tot.withinss
+      }
+    )
+  )
+
+ggplot(wss_results, aes(x = k, y = wss)) +
+  geom_line(color = "#2C3E50") +
+  geom_point(color = "#2C3E50", size = 2) +
+  scale_x_continuous(breaks = 1:8) +
+  labs(
+    title = "Elbow Plot for K-Means Clustering",
+    x = "Number of Clusters",
+    y = "Total Within-Cluster Sum of Squares"
+  )
+```
+
+The elbow plot decreases because adding more clusters always reduces the within-cluster sum of squares. The biggest improvements happen in the first few clusters, and the curve begins to flatten after about 3 clusters. I chose 3 clusters because it captures the main movie profiles without making the clustering too fragmented or hard to interpret.
+
+```{r}
+#| label: kmeans-fit
+
+set.seed(437)
+
+movie_clusters <- kmeans(cluster_data, centers = 3, nstart = 25)
+
+movies_train_clusters <- movies_train |>
+  dplyr::mutate(
+    cluster = factor(
+      movie_clusters$cluster,
+      levels = c(1, 2, 3),
+      labels = c(
+        "Drama/comedy/romance",
+        "Horror/thriller",
+        "Action/adventure"
+      )
+    )
+  )
+
+cluster_summary <- movies_train_clusters |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarize(
+    n = n(),
+    median_budget = median(budget),
+    median_profit_rate = median(profit_rate),
+    pct_action = mean(action),
+    pct_adventure = mean(adventure),
+    pct_drama = mean(drama),
+    pct_horror = mean(horror),
+    pct_thriller = mean(thriller),
+    pct_comedy = mean(comedy),
+    pct_romance = mean(romance),
+
+    .groups = "drop"
+  )
+
+cluster_summary |>
+  dplyr::mutate(
+    median_budget = scales::dollar(median_budget),
+    median_profit_rate = scales::percent(median_profit_rate, accuracy = 0.1),
+    dplyr::across(starts_with("pct_"), ~ scales::percent(.x, accuracy = 1))
+  )
+```
+
+The clustering results were useful because they separated movies into interpretable groups. The horror/thriller cluster had a lower median budget but a higher median profit rate. The action/adventure cluster had larger budgets, but its median relative return was lower than the horror/thriller group.
+
+```{r}
+#| label: cluster-return-plot
+
+ggplot(movies_train_clusters, aes(x = cluster, y = log_return, fill = cluster)) +
+  geom_boxplot(alpha = 0.85, outlier.alpha = 0.20) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray45") +
+  scale_fill_manual(values = c("#5D6D7E", "#D55E00", "#2C3E50")) +
+  scale_y_continuous(
+    breaks = log10(c(0.01, 0.1, 0.5, 1, 2, 10, 100)),
+    labels = c("0.01x", "0.1x", "0.5x", "1x", "2x", "10x", "100x")
+  ) +
+  labs(
+    title = "Relative Return by Movie Cluster",
+    x = "Cluster",
+    y = "Revenue as a Multiple of Budget (log scale)",
+    fill = "Cluster"
+  ) +
+  theme(legend.position = "none")
+
+```
+
+The clusters do not perfectly predict relative return, but they show that the type of movie is related to return compared with budget. This supports using budget and genre-based predictors in the supervised modeling section.
+
+Values below 1x mean the movie earned less revenue than its budget, so it lost money relative to its reported production cost. For example, 0.5x means the movie earned about half of its budget, while 0.1x means it earned about 10% of its budget. The graph shows the size of the return relative to budget, not the exact dollar loss.
+
+## Supervised Learning: Regression Models
+
+For supervised learning, I predicted `log_return` using movie characteristics available in the dataset: budget, runtime, release month, and genre indicators. Because `log_return` is numeric, regression models are the appropriate choice.
+
+I compared two models:
+
+1.  Linear regression, as a simple and interpretable baseline.
+2.  A regression tree, which can capture nonlinear splits and is easier to interpret visually.
+
+```{r}
+#| label: model-recipes
+
+set.seed(437)
+
+movie_folds <- vfold_cv(
+  movies_train,
+  v = 5,
+  repeats = 2,
+  strata = log_return
+)
+
+profit_recipe <- recipe(
+  log_return ~ log_budget + runtime + release_month +
+    action + adventure + comedy + drama +
+    horror + romance + thriller + science_fiction,
+  data = movies_train
+)
+
+linear_model <- linear_reg() |>
+  set_engine("lm")
+
+tree_model <- decision_tree(
+  mode = "regression",
+  cost_complexity = tune()
+) |>
+  set_engine("rpart")
+
+linear_workflow <- workflow() |>
+  add_model(linear_model) |>
+  add_recipe(profit_recipe)
+
+tree_workflow <- workflow() |>
+  add_model(tree_model) |>
+  add_recipe(profit_recipe)
+```
+
+```{r}
+#| label: model-tuning
+
+regression_metrics <- metric_set(rmse, rsq, mae)
+
+linear_resamples <- fit_resamples(
+  linear_workflow,
+  resamples = movie_folds,
+  metrics = regression_metrics
+)
+
+tree_grid <- grid_regular(
+  cost_complexity(range = c(-4, -1)),
+  levels = 10
+)
+
+tree_tune <- tune_grid(
+  tree_workflow,
+  resamples = movie_folds,
+  grid = tree_grid,
+  metrics = regression_metrics
+)
+
+best_tree <- select_best(tree_tune, metric = "rmse")
+```
+
+```{r}
+#| label: cv-results
+
+linear_cv <- collect_metrics(linear_resamples) |>
+  dplyr::mutate(model = "Linear regression")
+
+tree_cv <- collect_metrics(tree_tune) |>
+  dplyr::inner_join(best_tree, by = "cost_complexity") |>
+  dplyr::mutate(model = "Regression tree")
+
+cv_results <- dplyr::bind_rows(linear_cv, tree_cv) |>
+  dplyr::select(model, .metric, mean, std_err)
+
+cv_results |>
+  dplyr::mutate(
+    mean = round(mean, 3),
+    std_err = round(std_err, 3)
+  )
+```
+
+Cross-validation showed that the linear regression and regression tree performed similarly. Linear regression gives a useful baseline for understanding the direction of relationships, while the regression tree is easier to interpret because it makes simple splits. The R-squared values were modest, so these predictors explain only part of the variation in log relative return.
+
+The same pattern appeared on the test set. Both models still had low R-squared values, which means budget, runtime, release month, and genre explain only a small part of movie profitability. This supports the main conclusion that relative return is related to movie characteristics, but it also depends on many factors not included in this dataset.
+
+
+```{r}
+#| label: final-models
+
+final_tree_workflow <- finalize_workflow(tree_workflow, best_tree)
+
+linear_fit <- fit(linear_workflow, data = movies_train)
+tree_fit <- fit(final_tree_workflow, data = movies_train)
+
+linear_predictions <- augment(linear_fit, new_data = movies_test)
+tree_predictions <- augment(tree_fit, new_data = movies_test)
+
+test_results <- dplyr::bind_rows(
+  linear_predictions |>
+    metrics(truth = log_return, estimate = .pred) |>
+    dplyr::mutate(model = "Linear regression"),
+  tree_predictions |>
+    metrics(truth = log_return, estimate = .pred) |>
+    dplyr::mutate(model = "Regression tree")
+) |>
+  dplyr::select(model, .metric, .estimate)
+
+test_results |>
+  dplyr::mutate(.estimate = round(.estimate, 3))
+```
+
+```{r}
+#| label: linear-coefficients
+
+linear_fit |>
+  extract_fit_engine() |>
+  tidy() |>
+  dplyr::filter(term != "(Intercept)") |>
+  dplyr::arrange(p.value) |>
+  dplyr::slice_head(n = 6) |>
+  dplyr::mutate(
+    estimate = round(estimate, 3),
+    p.value = signif(p.value, 3)
+  )
+```
+
+The linear model suggests that relative return is not simply about spending more money. In fact, after controlling for genre, runtime, and release month, larger budget is associated with lower `log_return`. This makes sense because it is harder for a very expensive movie to earn many times its budget.
+
+```{r}
+#| label: final-tree-output
+
+tree_fit |>
+  extract_fit_engine()
+```
+
+The regression tree’s main split is based on budget. The smaller-budget branch has a much higher predicted relative return, but it contains only 48 movies, so I interpret this cautiously. It suggests that very small-budget movies can sometimes have high return multiples, but this is not a guarantee for all small-budget movies.
+
+## Conclusion
+
+The goal of this project was to study which movie characteristics are associated with higher return multiples, meaning higher revenue compared with budget. Measuring profitability this way makes the analysis fairer because it compares movies by return relative to cost, not only by total dollars.
+
+The unsupervised learning section showed that k-means grouped movies into different budget and genre profiles. In particular, the horror/thriller cluster had lower budgets but stronger median return multiples. The supervised models also showed that budget matters, but not in a simple "bigger is always better" way. Bigger budgets may help generate large total profits, but they do not automatically create higher return multiples. In this project, smaller-budget movies sometimes had stronger returns relative to cost.
+
+Overall, budget and genre helped explain some differences in relative return, but the model performance was still limited. I would not claim that these variables fully predict movie success. Marketing, franchise popularity, reviews, cast, release competition, and audience interest are likely important missing factors.
